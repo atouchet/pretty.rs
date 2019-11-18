@@ -202,7 +202,8 @@ where
         next: &'a Doc<'a, T, A>,
         bcmds: &[Cmd<'a, T, A>],
         fcmds: &mut Vec<&'a Doc<'a, T, A>>,
-        mut rem: isize,
+        mut pos: usize,
+        width: usize,
         newline_fits: fn(Mode) -> bool,
     ) -> bool
     where
@@ -245,8 +246,8 @@ where
                     }
                     Doc::Space => match mode {
                         Mode::Flat => {
-                            rem -= 1;
-                            if rem < 0 {
+                            pos += 1;
+                            if pos > width {
                                 return false;
                             }
                         }
@@ -256,8 +257,8 @@ where
                     // fit on the current line
                     Doc::Newline => return newline_fits(mode),
                     Doc::Text(ref str) => {
-                        rem -= str.len() as isize;
-                        if rem < 0 {
+                        pos += str.len();
+                        if pos > width {
                             return false;
                         }
                     }
@@ -266,6 +267,11 @@ where
                             Mode::Break => b,
                             Mode::Flat => f,
                         };
+                        continue;
+                    }
+
+                    Doc::Column(ref f) => {
+                        doc = f(pos);
                         continue;
                     }
 
@@ -319,8 +325,9 @@ where
                         continue;
                     }
                     Mode::Break => {
-                        let rem = width as isize - pos as isize;
-                        cmd = if fitting(doc, &bcmds, &mut fcmds, rem, |mode| mode == Mode::Break) {
+                        cmd = if fitting(doc, &bcmds, &mut fcmds, pos, width, |mode| {
+                            mode == Mode::Break
+                        }) {
                             (ind, Mode::Flat, &**doc)
                         } else {
                             (ind, Mode::Break, doc)
@@ -356,12 +363,15 @@ where
                     continue;
                 }
                 Doc::Union(ref l, ref r) => {
-                    let rem = width as isize - pos as isize;
-                    cmd = if fitting(l, &bcmds, &mut fcmds, rem, |_| true) {
+                    cmd = if fitting(l, &bcmds, &mut fcmds, pos, width, |_| true) {
                         (ind, mode, l)
                     } else {
                         (ind, mode, r)
                     };
+                    continue;
+                }
+                Doc::Column(ref f) => {
+                    cmd = (ind, mode, f(pos));
                     continue;
                 }
             }

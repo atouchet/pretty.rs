@@ -145,10 +145,7 @@
 pub extern crate termcolor;
 extern crate typed_arena;
 
-use std::borrow::Cow;
-use std::fmt;
-use std::io;
-use std::ops::Deref;
+use std::{borrow::Cow, fmt, io,rc::Rc, ops::Deref};
 #[cfg(feature = "termcolor")]
 use termcolor::{ColorSpec, WriteColor};
 
@@ -163,8 +160,8 @@ pub use self::render::{FmtWrite, IoWrite, Render, RenderAnnotated};
 ///
 /// The `T` parameter is used to abstract over pointers to `Doc`. See `RefDoc` and `BoxDoc` for how
 /// it is used
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum Doc<'a, T, A = ()> {
+#[derive(Clone)]
+pub enum Doc<'a, T, A: 'a = ()> {
     Nil,
     Append(T, T),
     Group(T),
@@ -175,6 +172,33 @@ pub enum Doc<'a, T, A = ()> {
     Text(Cow<'a, str>),
     Annotated(A, T),
     Union(T, T),
+    Column(Rc<dyn Fn(usize) -> T + 'a>),
+}
+
+impl<T, A> fmt::Debug for Doc<'_, T, A>
+where
+    T: fmt::Debug,
+    A: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Doc::Nil => f.debug_tuple("Nil").finish(),
+            Doc::Append(ref ldoc, ref rdoc) => {
+                f.debug_tuple("Append").field(ldoc).field(rdoc).finish()
+            }
+            Doc::FlatAlt(ref x, ref y) => f.debug_tuple("FlatAlt").field(x).field(y).finish(),
+            Doc::Group(ref doc) => f.debug_tuple("Group").field(doc).finish(),
+            Doc::Nest(off, ref doc) => f.debug_tuple("Nest").field(&off).field(doc).finish(),
+            Doc::Space => f.debug_tuple("Space").finish(),
+            Doc::Newline => f.debug_tuple("Newline").finish(),
+            Doc::Text(ref s) => f.debug_tuple("Text").field(s).finish(),
+            Doc::Annotated(ref ann, ref doc) => {
+                f.debug_tuple("Annotated").field(ann).field(doc).finish()
+            }
+            Doc::Union(ref l, ref r) => f.debug_tuple("Union").field(l).field(r).finish(),
+            Doc::Column(_) => f.debug_tuple("Column(..)").finish(),
+        }
+    }
 }
 
 impl<'a, T, A> Doc<'a, T, A> {
@@ -392,7 +416,7 @@ impl<'a, T> Doc<'a, T, ColorSpec> {
     }
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone)]
 pub struct BoxDoc<'a, A>(Box<Doc<'a, BoxDoc<'a, A>, A>>);
 
 impl<'a, A> fmt::Debug for BoxDoc<'a, A>
@@ -420,7 +444,6 @@ impl<'a, A> Deref for BoxDoc<'a, A> {
 
 /// The `DocBuilder` type allows for convenient appending of documents even for arena allocated
 /// documents by storing the arena inline.
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
 pub struct DocBuilder<'a, D, A = ()>(pub &'a D, pub Doc<'a, D::Doc, A>)
 where
     D: ?Sized + DocAllocator<'a, A> + 'a;
@@ -446,8 +469,11 @@ where
 }
 
 /// The `DocAllocator` trait abstracts over a type which can allocate (pointers to) `Doc`.
-pub trait DocAllocator<'a, A = ()> {
-    type Doc: Deref<Target = Doc<'a, Self::Doc, A>>;
+pub trait DocAllocator<'a, A = ()>
+where
+    A: 'a,
+{
+    type Doc: Deref<Target = Doc<'a, Self::Doc, A>> + 'a;
 
     fn alloc(&'a self, Doc<'a, Self::Doc, A>) -> Self::Doc;
 
@@ -544,6 +570,22 @@ pub trait DocAllocator<'a, A = ()> {
         }
 
         result
+    }
+
+
+    /// Allocate a document that acts differently based on the position and page layout
+    ///
+    /// ```rust
+    /// use pretty::DocAllocator;
+    ///
+    /// let arena = pretty::Arena::new();
+    /// let doc = arena.text("prefix")
+    ///     .append(arena.column(|l| &*arena.text("| <- column").append(arena.to_string(l)));
+    /// assert_eq!(doc.0.pretty(80).to_string(), "prefix | <- column 7");
+    /// ```
+    #[inline]
+    fn column(&'a self, f: impl Fn(usize) -> Self::Doc + 'a) -> DocBuilder<'a, Self, A> {
+        DocBuilder(self, Doc::Column(Rc::new(f)))
     }
 }
 
@@ -648,8 +690,14 @@ where
 }
 
 /// Newtype wrapper for `&Doc`
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RefDoc<'a, A: 'a>(&'a Doc<'a, RefDoc<'a, A>, A>);
+
+impl<A> Copy for RefDoc<'_, A> {}
+impl<A> Clone for RefDoc<'_, A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 
 impl<'a, A> fmt::Debug for RefDoc<'a, A>
 where
@@ -674,6 +722,7 @@ pub type Arena<'a, A = ()> = typed_arena::Arena<Doc<'a, RefDoc<'a, A>, A>>;
 impl<'a, D, A> DocAllocator<'a, A> for &'a D
 where
     D: ?Sized + DocAllocator<'a, A>,
+    A: 'a,
 {
     type Doc = D::Doc;
 
@@ -705,7 +754,10 @@ pub struct BoxAllocator;
 
 static BOX_ALLOCATOR: BoxAllocator = BoxAllocator;
 
-impl<'a, A> DocAllocator<'a, A> for BoxAllocator {
+impl<'a, A> DocAllocator<'a, A> for BoxAllocator
+where
+    A: 'a,
+{
     type Doc = BoxDoc<'a, A>;
 
     #[inline]
